@@ -65,7 +65,7 @@ namespace MariaPerformanceTest
 			long[] totalStat = new long[UpdateOrInsertBenchmark.NUM_ST_TYPES];
 
 			//
-			// UPDATE/INSERT 스탯
+			// UPDATE/INSERT 스탯 수집 + 초기화 (매 초마다 수집된 통계 정보 출력)
 			//
 			foreach (var benchmark in updateOrInsertBenchmarks)
 			{
@@ -132,85 +132,89 @@ namespace MariaPerformanceTest
 			{
 				using (MySqlConnection conn = new MySqlConnection(Program.ConnectionString))
 				{
-					conn.Open();
-
-					bool moreToDo = true;
-					while (moreToDo)
+					using (MySqlCommand cmd = new MySqlCommand(Program.SqlUpdate, conn))
 					{
-						if (!this.ct.IsCancellationRequested)
-						{
-							//
-							// 파라미터를 랜덤하게 생성
-							//
-							string p1 = string.Format($"W{rand.Next(minWorkerId, maxWorkerId):D5}");
-							DateTime p2 = DateTime.Now;
-							string p3 = string.Format($"{rand.NextDouble() * 1000:N7}");
-							string p4 = string.Format($"{rand.NextDouble() * 1000:N7}");
-							string p5 = string.Format($"{rand.NextDouble() * 10:N3}");
-							string p6 = rand.Next() % 2 == 0 ? "Y" : "N";
-							int result = 0;
+						cmd.Parameters.Add("@P1", MySqlDbType.VarString);
+						cmd.Parameters.Add("@P2", MySqlDbType.DateTime);
+						cmd.Parameters.Add("@P3", MySqlDbType.VarString);
+						cmd.Parameters.Add("@P4", MySqlDbType.VarString);
+						cmd.Parameters.Add("@P5", MySqlDbType.VarString);
+						cmd.Parameters.Add("@P6", MySqlDbType.VarString);
 
-							//
-							// UPDATE 시도
-							//
-							using (MySqlCommand cmd = new MySqlCommand(Program.SqlUpdate, conn))
+						conn.Open();
+
+						bool moreToDo = true;
+						while (moreToDo)
+						{
+							if (!this.ct.IsCancellationRequested)
 							{
-								cmd.Parameters.AddWithValue("@P1", p1);
-								cmd.Parameters.AddWithValue("@P2", p2);
-								cmd.Parameters.AddWithValue("@P3", p3);
-								cmd.Parameters.AddWithValue("@P4", p4);
-								cmd.Parameters.AddWithValue("@P5", p5);
-								cmd.Parameters.AddWithValue("@P6", p6);
+								//
+								// 파라미터를 랜덤하게 생성
+								//
+								string p1 = string.Format($"W{rand.Next(minWorkerId, maxWorkerId):D5}");
+								DateTime p2 = DateTime.Now;
+								string p3 = string.Format($"{rand.NextDouble() * 1000:N7}");
+								string p4 = string.Format($"{rand.NextDouble() * 1000:N7}");
+								string p5 = string.Format($"{rand.NextDouble() * 10:N3}");
+								string p6 = rand.Next() % 2 == 0 ? "Y" : "N";
+								int result = 0;
+
+								cmd.Parameters["@P1"].Value = p1;
+								cmd.Parameters["@P2"].Value = p2;
+								cmd.Parameters["@P3"].Value = p3;
+								cmd.Parameters["@P4"].Value = p4;
+								cmd.Parameters["@P5"].Value = p5;
+								cmd.Parameters["@P6"].Value = p6;
 
 								watch.Restart();
 								result = cmd.ExecuteNonQuery();
 								watch.Stop();
-							}
 
-							if (0 < result)
-							{
-								//
-								// UPDATE 된 경우
-								//
-								Interlocked.Increment(ref this.stats[OP_TYPE_UPDATED, ST_TYPE_COUNT]);
-								Interlocked.Add(ref this.stats[OP_TYPE_UPDATED, ST_TYPE_ELAPSED_MILLISECONDS], watch.ElapsedMilliseconds);
+								if (0 < result)
+								{
+									//
+									// UPDATE 된 경우
+									//
+									Interlocked.Increment(ref this.stats[OP_TYPE_UPDATED, ST_TYPE_COUNT]);
+									Interlocked.Add(ref this.stats[OP_TYPE_UPDATED, ST_TYPE_ELAPSED_MILLISECONDS], watch.ElapsedMilliseconds);
+								}
+								else
+								{
+									//
+									// UPDATE 안 된 경우
+									//
+
+									//
+									// 레코드가 없어서 업데이트가 안 된 기록 추가
+									//
+									Interlocked.Increment(ref this.stats[OP_TYPE_NON_UPDATED, ST_TYPE_COUNT]);
+									Interlocked.Add(ref this.stats[OP_TYPE_NON_UPDATED, ST_TYPE_COUNT], watch.ElapsedMilliseconds);
+
+									//
+									// INSERT 시도
+									//
+									using (MySqlCommand cmdInsert = new MySqlCommand(Program.SqlInsert, conn))
+									{
+										cmdInsert.Parameters.AddWithValue("@P1", p1);
+										cmdInsert.Parameters.AddWithValue("@P2", p2);
+										cmdInsert.Parameters.AddWithValue("@P3", p3);
+										cmdInsert.Parameters.AddWithValue("@P4", p4);
+										cmdInsert.Parameters.AddWithValue("@P5", p5);
+										cmdInsert.Parameters.AddWithValue("@P6", p6);
+
+										watch.Restart();
+										result = cmdInsert.ExecuteNonQuery();
+										watch.Stop();
+
+										Interlocked.Increment(ref this.stats[OP_TYPE_INSERTED, ST_TYPE_COUNT]);
+										Interlocked.Add(ref this.stats[OP_TYPE_INSERTED, ST_TYPE_COUNT], watch.ElapsedMilliseconds);
+									}
+								}
 							}
 							else
 							{
-								//
-								// UPDATE 안 된 경우
-								//
-
-								//
-								// 레코드가 없어서 업데이트가 안 된 기록 추가
-								//
-								Interlocked.Increment(ref this.stats[OP_TYPE_NON_UPDATED, ST_TYPE_COUNT]);
-								Interlocked.Add(ref this.stats[OP_TYPE_NON_UPDATED, ST_TYPE_COUNT], watch.ElapsedMilliseconds);
-
-								//
-								// INSERT 시도
-								//
-								using (MySqlCommand cmd = new MySqlCommand(Program.SqlInsert, conn))
-								{
-									cmd.Parameters.AddWithValue("@P1", p1);
-									cmd.Parameters.AddWithValue("@P2", p2);
-									cmd.Parameters.AddWithValue("@P3", p3);
-									cmd.Parameters.AddWithValue("@P4", p4);
-									cmd.Parameters.AddWithValue("@P5", p5);
-									cmd.Parameters.AddWithValue("@P6", p6);
-
-									watch.Restart();
-									result = cmd.ExecuteNonQuery();
-									watch.Stop();
-
-									Interlocked.Increment(ref this.stats[OP_TYPE_INSERTED, ST_TYPE_COUNT]);
-									Interlocked.Add(ref this.stats[OP_TYPE_INSERTED, ST_TYPE_COUNT], watch.ElapsedMilliseconds);
-								}
+								ct.ThrowIfCancellationRequested();
 							}
-						}
-						else
-						{
-							ct.ThrowIfCancellationRequested();
 						}
 					}
 				}

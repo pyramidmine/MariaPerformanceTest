@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Data;
 using System.Diagnostics;
 using System.Linq;
 using System.Text;
@@ -14,12 +15,17 @@ namespace MariaPerformanceTest
 		public static string ConnectionString { get; } = @"Server=192.168.0.54;Port=3306;Database=DB_EDWARD;Uid=root;Pwd=Rksvndrl!@;";
 		public static string SqlUpdate { get; } = @"UPDATE MN_GR_WK_LOC SET MOD_DATE=@P2, WK_LAT_Y=@P3, WK_LNG_X=@P4, ACCURACY=@P5, GPS_USE_YN=@P6 WHERE WK_CODE=@P1;";
 		public static string SqlInsert { get; } = @"INSERT INTO MN_GR_WK_LOC VALUES (@P1, @P2, @P3, @P4, @P5, @P6);";
+		public static string SqlSelect { get; } = @"SELECT * FROM MN_GR_WK_LOC WHERE WK_CODE = @P1;";
 
 		static readonly int NUM_WORKERS = 50000;
 
 		static readonly int UPDATING_THREAD_COUNT = Environment.ProcessorCount;
 		static List<UpdateOrInsertBenchmark> updateOrInsertBenchmarks = new List<UpdateOrInsertBenchmark>();
 		static List<Thread> updateOrInsertThreads = new List<Thread>();
+
+		static readonly int SELECT_THREAD_COUNT = 2;
+		static List<SelectBenchmark> selectBenchmarks = new List<SelectBenchmark>();
+		static List<Thread> selectThreads = new List<Thread>();
 
 		static void Main(string[] args)
 		{
@@ -40,6 +46,16 @@ namespace MariaPerformanceTest
 						updateOrInsertThreads.Add(thread);
 						thread.Start();
 					}
+
+					//
+					// SELECT 쓰레드 생성 및 실행
+					//
+					selectBenchmarks.Add(new SelectBenchmark(100, 0, NUM_WORKERS, cts.Token, SelectBenchmark.DataSelectType.DataAdapter));
+					selectThreads.Add(new Thread(new ThreadStart(selectBenchmarks[0].DoSelect)));
+					selectThreads[0].Start();
+					selectBenchmarks.Add(new SelectBenchmark(101, 0, NUM_WORKERS, cts.Token, SelectBenchmark.DataSelectType.DataReader));
+					selectThreads.Add(new Thread(new ThreadStart(selectBenchmarks[1].DoSelect)));
+					selectThreads[1].Start();
 
 					//
 					// 통계 출력 스레드 실행
@@ -92,6 +108,19 @@ namespace MariaPerformanceTest
 			Console.Write($"{totalStat[0],5}");
 			Console.ForegroundColor = defaultForegroundColor;
 			Console.WriteLine();
+
+			//
+			// SELECT 통계
+			//
+			long[] totalSelectStat = new long[SelectBenchmark.NUM_ST_TYPES];
+			long[] selectStat = new long[SelectBenchmark.NUM_ST_TYPES];
+			foreach (var benchmark in selectBenchmarks)
+			{
+				Array.Clear(selectStat, 0, selectStat.Length);
+				benchmark.CollectStatistics(ref selectStat, ref totalSelectStat);
+				Console.WriteLine($"{DateTime.Now:HH:mm:ss}, THD:{benchmark.ThreadId}, CN:{selectStat[0],5}, MS:{selectStat[1],3}");
+			}
+			Console.WriteLine($"{DateTime.Now:HH:mm:ss}, CN:{totalSelectStat[0],5}");
 		}
 	}
 
@@ -240,6 +269,118 @@ namespace MariaPerformanceTest
 				{
 					stats[i, j] = Interlocked.Exchange(ref this.stats[i, j], 0);
 				}
+			}
+		}
+	}
+
+	class SelectBenchmark
+	{
+		public enum DataSelectType
+		{
+			DataAdapter,
+			DataReader,
+		}
+
+		static readonly int ST_TYPE_COUNT = 0;
+		static readonly int ST_TYPE_ELAPSED_MILLISECONDS = 1;
+		public static readonly int NUM_ST_TYPES = 2;
+
+		long[] stats = new long[NUM_ST_TYPES];
+
+		public int ThreadId { get; }
+		readonly int minWorkerId;
+		readonly int maxWorkerId;
+		readonly CancellationToken ct;
+		readonly DataSelectType dataSelectType;
+
+		public SelectBenchmark(int threadId, int minWorkerId, int maxWorkerId, CancellationToken ct, DataSelectType dataSelectType)
+		{
+			ThreadId = threadId;
+			this.minWorkerId = minWorkerId;
+			this.maxWorkerId = maxWorkerId;
+			this.ct = ct;
+			this.dataSelectType = dataSelectType;
+		}
+
+		public void DoSelect()
+		{
+			Console.WriteLine($"{DateTime.Now:HH:mm:ss}, DoSelect({ThreadId}, {minWorkerId}, {maxWorkerId}, ct) started...");
+
+			Random rand = new Random();
+			Stopwatch watch = new Stopwatch();
+
+			try
+			{
+				using (MySqlConnection conn = new MySqlConnection(Program.ConnectionString))
+				{
+					Console.WriteLine($"DoSelect, THD={ThreadId}, MySqlConnection.GetHashCode()={conn.GetHashCode()}");
+					using (MySqlCommand cmd = new MySqlCommand(Program.SqlSelect, conn))
+					{
+						Console.WriteLine($"DoSelect, THD={ThreadId}, MySqlCommand.GetHashCode()={cmd.GetHashCode()}");
+						cmd.Parameters.Add("@P1", MySqlDbType.VarChar);
+
+						conn.Open();
+
+						bool moreToDo = true;
+						while (moreToDo)
+						{
+							if (!this.ct.IsCancellationRequested)
+							{
+								// 파라미터를 랜덤하게 생성
+								string p1 = string.Format($"W{rand.Next(minWorkerId, maxWorkerId):D5}");
+								int result = 0;
+
+								cmd.Parameters["@P1"].Value = p1;
+
+								watch.Restart();
+								switch (this.dataSelectType)
+								{
+									case DataSelectType.DataAdapter:
+										using (MySqlDataAdapter adapter = new MySqlDataAdapter(cmd))
+										{
+											DataSet dataSet = new DataSet();
+											result = adapter.Fill(dataSet);
+										}
+										break;
+									case DataSelectType.DataReader:
+										using (MySqlDataReader reader = cmd.ExecuteReader())
+										{
+											result = reader.HasRows ? 1 : 0;
+										}
+										break;
+								}
+								watch.Stop();
+
+								Interlocked.Increment(ref this.stats[ST_TYPE_COUNT]);
+								Interlocked.Add(ref this.stats[ST_TYPE_ELAPSED_MILLISECONDS], watch.ElapsedMilliseconds);
+							}
+							else
+							{
+								ct.ThrowIfCancellationRequested();
+							}
+						}
+					}
+				}
+			}
+			catch (OperationCanceledException ex)
+			{
+				Console.WriteLine($"DoSelect(), {ex.Message}");
+			}
+			catch (Exception ex)
+			{
+				Console.WriteLine($"DoSelect(), ThreadId={ThreadId}, {ex.Message}");
+			}
+		}
+
+		public void CollectStatistics(ref long[] stats, ref long[] totalStat)
+		{
+			//
+			// 스탯 복사
+			//
+			for (int i = 0; i < NUM_ST_TYPES; i++)
+			{
+				stats[i] = Interlocked.Exchange(ref this.stats[i], 0);
+				totalStat[i] += stats[i];
 			}
 		}
 	}
